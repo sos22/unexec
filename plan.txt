@@ -1,0 +1,24 @@
+Aim here is to do basically the unexec hack: something which lets you
+dump the current state of a program into an ELF executable which you
+can reinstantiate. Probably something like setjmp: return one thing
+the first time out, and another think when you rehydrate. Aim is to
+make setting up global variables very cheap.
+
+Obvious downside: you lose all the address randomisation stuff. Not
+sure about doing it in production, but might be handy for the support
+tools I want to build.
+
+
+
+Complications: the kernel maps a whole load of random stuff which we
+don't want. So we need to unmap it. Plan is going to be like this: we
+have one loadable phdr which contains an initial trampoline. That
+trampoline first unmaps everything other than itself, then goes and
+maps everything which we actually want out of non-loadable phdrs and
+direct mmaps, then restores registers, and then returns back to
+libunexec. libunexec then munmaps the trampoline and returns to the
+client.
+
+Building the trampoline is going to be the fun part. Start by looking
+at /proc/self/maps to find out what we're aiming for, then go and do
+an additional pass to convert the plan into a trampoline.
