@@ -178,7 +178,6 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    movq %c[stash_r15](%%r15), %%r15\n"
         /* save_registers() returns 1 in the new process. */
         "    mov $1, %%eax\n"
-        "    ud2\n"
         "    ret\n"
         "3:\n"
         "    ud2\n"
@@ -328,17 +327,16 @@ static int parse_mappings(char * str, struct trampoline * out) {
                                           offset);
                 close(fd);
                 if (remap == MAP_FAILED) goto fail;
-                if (memcmp(remap, (const void *)mapping->start, mapping->size)){
-                    can_use_mmap = false; }
-                munmap((void *)remap, mapping->size);
-                can_use_mmap = true; }
+                can_use_mmap =
+                    memcmp(remap, (const void *)mapping->start, mapping->size)
+                    == 0;
+                munmap((void *)remap, mapping->size); }
             errno = 0; }
         if (can_use_mmap) {
             /* If we can use an mmap then do it. */
             mapping->offset = offset;
             mapping->path = strdup_in_trampoline(path, out); }
-        else if (can_use_phdr) {
-            /* phdrs are the default. */ }
+        else if (can_use_phdr) { /* phdrs are the default. */ }
         else {
             /* Can't mmap, can't phdr -> we fail */
             goto fail; }
