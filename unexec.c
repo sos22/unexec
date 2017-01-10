@@ -1,8 +1,10 @@
 #include "unexec.h"
 
+#include <asm/prctl.h>
 #include <sys/types.h>
 #include <sys/fcntl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <assert.h>
@@ -17,6 +19,8 @@
 
 #define PAGE_SIZE 4096
 #define offsetof(field, strct) ((unsigned long)&((strct *)0ul)->field)
+
+int arch_prctl(int code, unsigned long * fsbase);
 
 /* A thing which the trampoline is going to have to mmap. */
 struct mapping {
@@ -122,9 +126,20 @@ static char * strdup_in_trampoline(const char *what, struct trampoline * tramp){
 /* Build the lump of machine code which the ELF binary entry point
  * will point at. */
 static void * alloc_trampoline_text(struct trampoline *out) {
+    /* We need a valid fsbase to call into libc, for the PLT, so
+     * restore it from the trampoline. */
+    unsigned long fsbase;
+    if (arch_prctl(ARCH_GET_FS, &fsbase) < 0) return NULL;
     asm(
         "    jmp end_trampoline\n"
         "start_trampoline:\n"
+        "    movq %[_ARCH_SET_FS], %%rdi\n"
+        "set_rsi_fsbase:\n"
+        "    movq $0x123456789, %%rsi\n" /* patched to fsbase */
+        "    mov %[___NR_arch_prctl], %%eax\n"
+        "    syscall\n"
+        "    testq %%rax, %%rax\n"
+        "    js 2f\n"
         "set_r15_tramp:\n"
         "    movq $0x123456789, %%r15\n" /* Patched to @out later */
         "    movq %c[mappings](%%r15), %%r14\n" /* r14 is next mapping */
@@ -193,6 +208,8 @@ static void * alloc_trampoline_text(struct trampoline *out) {
           [offsetflags] "i" (offsetof(flags, struct mapping)),
           [offsetoffset] "i" (offsetof(offset, struct mapping)),
           [_O_RDONLY] "i" (O_RDONLY),
+          [_ARCH_SET_FS] "i" (ARCH_SET_FS),
+          [___NR_arch_prctl] "i" (__NR_arch_prctl),
           [___NR_open] "i" (__NR_open),
           [___NR_mmap] "i" (__NR_mmap),
           [___NR_close] "i" (__NR_close),
@@ -206,10 +223,13 @@ static void * alloc_trampoline_text(struct trampoline *out) {
           [stash_ret] "i" (offsetof(stash.ret, struct trampoline))
         );
     extern const unsigned char start_trampoline[0];
+    extern const unsigned char set_rsi_fsbase[0];
     extern const unsigned char set_r15_tramp[0];
     extern const unsigned char end_trampoline[0];
     char * res = alloc_in_trampoline(end_trampoline - start_trampoline, out);
     memcpy(res, start_trampoline, end_trampoline - start_trampoline);
+    *(unsigned long *)(res + 2 + (set_rsi_fsbase - start_trampoline)) =
+        (unsigned long)fsbase;
     *(unsigned long *)(res + 2 + (set_r15_tramp - start_trampoline)) =
         (unsigned long)out;
     return res; }
@@ -232,46 +252,45 @@ static int parse_mappings(char * str, struct trampoline * out) {
     errno = 0;
     char * line_start;
     for (line_start = str; *line_start; line_start = line_end + 1) {
-        assert(nrdone < out->nrmappings);
-        struct mapping * mapping = &out->mappings[nrdone];
         for (line_end = line_start; *line_end != '\n'; line_end++) {
             assert(*line_end); }
         *line_end = '\0';
         char * cursor;
-        mapping->start = strtoul(line_start, &cursor, 16);
+        struct mapping mapping = {};
+        mapping.start = strtoul(line_start, &cursor, 16);
         if (*cursor != '-') goto fail;
         cursor++;
         uint64_t end = strtoul(cursor, &cursor, 16);
         if (*cursor != ' ') goto fail;
-        mapping->size = end - mapping->start;
+        mapping.size = end - mapping.start;
         cursor++;
         switch (*cursor) {
         case 'r':
-            mapping->prot |= PROT_READ;
+            mapping.prot |= PROT_READ;
             break;
         case '-': break;
         default: goto fail; }
         cursor++;
         switch (*cursor) {
         case 'w':
-            mapping->prot |= PROT_WRITE;
+            mapping.prot |= PROT_WRITE;
             break;
         case '-': break;
         default: goto fail; }
         cursor++;
         switch (*cursor) {
         case 'x':
-            mapping->prot |= PROT_EXEC;
+            mapping.prot |= PROT_EXEC;
             break;
         case '-': break;
         default: goto fail; }
         cursor++;
         switch (*cursor) {
         case 'p':
-            mapping->flags = MAP_PRIVATE;
+            mapping.flags = MAP_PRIVATE;
             break;
         case 's':
-            mapping->flags = MAP_SHARED;
+            mapping.flags = MAP_SHARED;
             break;
         default: goto fail; }
         cursor++;
@@ -294,11 +313,11 @@ static int parse_mappings(char * str, struct trampoline * out) {
         if (!strcmp(path, "[vsyscall]")) {
             *line_end = '\n';
             continue; }
-        mapping->flags |= MAP_FIXED;
+        mapping.flags |= MAP_FIXED;
         /* Other things we need to fix up somehow. Options are phdrs
          * and mmaps. */
         /* Phdr is safe for any non-shared mapping. */
-        bool can_use_phdr = mapping->flags != MAP_SHARED;
+        bool can_use_phdr = mapping.flags != MAP_SHARED;
         /* mmap is a bit more tricky: Have to be able to read the
          * file, and if it's private in-memory content needs to
          * match file contents */
@@ -312,7 +331,7 @@ static int parse_mappings(char * str, struct trampoline * out) {
             if (stat(path, &st) < 0) {
                 if (errno != ENOENT) goto fail;
                 can_use_mmap = false; }
-            else if (!(mapping->prot & PROT_READ)) {
+            else if (!(mapping.prot & PROT_READ)) {
                 /* Cannot read map -> assume that mmap is safe */
                 can_use_mmap = true; }
             else {
@@ -320,7 +339,7 @@ static int parse_mappings(char * str, struct trampoline * out) {
                 int fd = open(path, O_RDONLY);
                 if (fd < 0) goto fail;
                 const void * remap = mmap(NULL,
-                                          mapping->size,
+                                          mapping.size,
                                           PROT_READ,
                                           MAP_PRIVATE,
                                           fd,
@@ -328,20 +347,22 @@ static int parse_mappings(char * str, struct trampoline * out) {
                 close(fd);
                 if (remap == MAP_FAILED) goto fail;
                 can_use_mmap =
-                    memcmp(remap, (const void *)mapping->start, mapping->size)
+                    memcmp(remap, (const void *)mapping.start, mapping.size)
                     == 0;
-                munmap((void *)remap, mapping->size); }
+                munmap((void *)remap, mapping.size); }
             errno = 0; }
         if (can_use_mmap) {
             /* If we can use an mmap then do it. */
-            mapping->offset = offset;
-            mapping->path = strdup_in_trampoline(path, out); }
+            mapping.offset = offset;
+            mapping.path = strdup_in_trampoline(path, out); }
         else if (can_use_phdr) { /* phdrs are the default. */ }
         else {
             /* Can't mmap, can't phdr -> we fail */
             goto fail; }
-        *line_end = '\n';
-        nrdone++; }
+        assert(nrdone < out->nrmappings);
+        out->mappings[nrdone] = mapping;
+        nrdone++;
+        *line_end = '\n'; }
     out->nrmappings = nrdone;
     printf("needed %d, had %d\n", out->used, out->allocated);
     if (errno) goto fail;
