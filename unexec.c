@@ -159,6 +159,9 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    testq %%rax, %%rax\n"
         "    js 3f\n"
         "    movq %%rax, %%r12\n"
+        /* XXX should probably make some attempt to check the world
+         * still looks like what we expect; otherwise, this'll be
+         * confusing. */
         /* Now do the mmap */
         "    movq %c[offsetstart](%%r14), %%rdi\n"
         "    movq %c[offsetsize](%%r14), %%rsi\n"
@@ -470,25 +473,27 @@ static int write_elf_binary(const char * path, struct trampoline * tramp){
     ssize_t sz = tramp->allocated + sizeof(*tramp);
     if (save_registers(&tramp->stash)) {
         /* We just got rehydrated. Let's go. */
-        return 1; }
+        return 0; }
     else {
         /* Final stage of writing down the ELF binary. */
         if (write(fd, tramp, sz) != sz) goto fail;
         close(fd);
-        return 0; }
+        return 1; }
   fail:
     close(fd);
     return -1; }
 
 /* How are we going to persist the in-memory state of the process? */
-static int _find_mappings(const char * path) {
+int unexec(const char * path) {
+    int r;
+    r = -1;
+    struct trampoline * tramp = MAP_FAILED;
+    size_t sz = 0;
     char * mappings_str = read_file("/proc/self/maps");
-    if (!mappings_str) return -1;
-    struct trampoline * tramp;
+    if (!mappings_str) goto end;
     /* Start with an allocator which can't do anything, even though we
      * know it'll fail, mostly so that that path gets tested. */
     size_t extra_sz = 0;
-    size_t sz;
     while (true) {
         sz = sizeof(*tramp) + extra_sz;
         sz = (sz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -498,48 +503,17 @@ static int _find_mappings(const char * path) {
                      MAP_PRIVATE|MAP_ANONYMOUS,
                      -1,
                      0);
-        if (tramp == MAP_FAILED) {
-            free(mappings_str);
-            return -1; }
+        if (tramp == MAP_FAILED) goto end;
         if (extra_sz != 0) tramp->allocated = sz - sizeof(*tramp);
         else tramp->allocated = 0;
-        if (parse_mappings(mappings_str, tramp) < 0) {
-            munmap(tramp, sz);
-            free(mappings_str);
-            return -1; }
+        if (parse_mappings(mappings_str, tramp) < 0) goto end;
         if (tramp->used <= tramp->allocated) break;
         /* Guessed too small. */
         extra_sz = tramp->used;
         munmap(tramp, sz); }
     place_phdrs(tramp);
-    if (write_elf_binary(path, tramp) < 0) {
-        free(mappings_str);
-        munmap(tramp, sz);
-        return -1; }
-    printf("assembled trampoline\n");
-    dump_trampoline(tramp);
+    r = write_elf_binary(path, tramp);
+  end:
     free(mappings_str);
-    abort(); }
-
-int unexec(const char * path) {
-    _find_mappings(path);
-#if 0
-    /* Build a trampoline containing almost everything we need, with
-     * the exception of registers, which get done right at the end of
-     * write_elf_binary(). */
-    struct trampoline * trampoline;
-    int res = build_trampoline(mappings, &trampoline);
-    if (res < 0) {
-        release_mappings(mappings);
-        return res; }
-    if (res == 1) {
-        /* We need to write the binary. */
-        if (write_elf_binary(trampoline, mappings, path) < 0) res = -1; }
-    /* Both sides now need to free the trampoline. */
-    if (munmap(trampoline, trampoline->size) < 0) {
-        /* This really shouldn't fail. */
-        err(1, "munmapping trampoline"); }
-    release_mappings(mappings);
-    return res;
-#endif
-}
+    if (tramp != MAP_FAILED) munmap(tramp, sz);
+    return r; }
