@@ -18,6 +18,8 @@
 #include <unistd.h>
 
 #define PAGE_SIZE 4096
+#define KERN_BASE 0x7ffffffff000
+
 #define offsetof(field, strct) ((unsigned long)&((strct *)0ul)->field)
 
 int arch_prctl(int code, unsigned long * fsbase);
@@ -133,13 +135,31 @@ static void * alloc_trampoline_text(struct trampoline *out) {
     asm(
         "    jmp end_trampoline\n"
         "start_trampoline:\n"
+        /* Set fsbase */
         "    movq %[_ARCH_SET_FS], %%rdi\n"
         "set_rsi_fsbase:\n"
         "    movq $0x123456789, %%rsi\n" /* patched to fsbase */
         "    mov %[___NR_arch_prctl], %%eax\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
-        "    js 2f\n"
+        "    js 3f\n"
+        /* munmap everything below the trampoline. */
+        "    movq $0, %%rdi\n"
+        "set_rsi_tramp:\n"
+        "    movq $0x123456789, %%rsi\n" /* patched later */
+        "    mov %[___NR_munmap], %%rax\n"
+        "    syscall\n"
+        "    testq %%rax, %%rax\n"
+        "    js 3f\n"
+        /* munmap everything above the trampoline. */
+        "set_rdi_tramp_top:\n"
+        "    movq $0x123456789, %%rdi\n"
+        "set_rsi_kern_base_tramp_top:\n"
+        "    movq $0x123456789, %%rsi\n" /* patched later */
+        "    mov %[___NR_munmap], %%rax\n"
+        "    syscall\n"
+        "    testq %%rax, %%rax\n"
+        "    js 3f\n"
         "set_r15_tramp:\n"
         "    movq $0x123456789, %%r15\n" /* Patched to @out later */
         "    movq %c[mappings](%%r15), %%r14\n" /* r14 is next mapping */
@@ -215,6 +235,7 @@ static void * alloc_trampoline_text(struct trampoline *out) {
           [___NR_arch_prctl] "i" (__NR_arch_prctl),
           [___NR_open] "i" (__NR_open),
           [___NR_mmap] "i" (__NR_mmap),
+          [___NR_munmap] "i" (__NR_munmap),
           [___NR_close] "i" (__NR_close),
           [stash_rbx] "i" (offsetof(stash.rbx, struct trampoline)),
           [stash_rsp] "i" (offsetof(stash.rsp, struct trampoline)),
@@ -227,12 +248,23 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         );
     extern const unsigned char start_trampoline[0];
     extern const unsigned char set_rsi_fsbase[0];
+    extern const unsigned char set_rsi_tramp[0];
+    extern const unsigned char set_rdi_tramp_top[0];
+    extern const unsigned char set_rsi_kern_base_tramp_top[0];
     extern const unsigned char set_r15_tramp[0];
     extern const unsigned char end_trampoline[0];
     char * res = alloc_in_trampoline(end_trampoline - start_trampoline, out);
     memcpy(res, start_trampoline, end_trampoline - start_trampoline);
     *(unsigned long *)(res + 2 + (set_rsi_fsbase - start_trampoline)) =
         (unsigned long)fsbase;
+    *(unsigned long *)(res + 2 + (set_rsi_tramp - start_trampoline)) =
+        (unsigned long)out;
+    unsigned long out_top = (unsigned long)out + out->allocated + sizeof(*out);
+    *(unsigned long *)(res + 2 + (set_rdi_tramp_top - start_trampoline)) =
+        out_top;
+    *(unsigned long *)(res + 2 + (set_rsi_kern_base_tramp_top -
+                                  start_trampoline)) =
+        KERN_BASE - out_top;
     *(unsigned long *)(res + 2 + (set_r15_tramp - start_trampoline)) =
         (unsigned long)out;
     return res; }
