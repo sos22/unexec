@@ -13,3 +13,5 @@ clean::
 	rm -f *.po *.so *~
 
 include tests/mk
+
+.PHONY: all clean

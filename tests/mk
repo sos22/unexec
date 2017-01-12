@@ -1,18 +1,18 @@
 all:: tests/smoke
 
-tests/smoke: tests/smoke.o libunexec.so
+tests/%: tests/%.o libunexec.so
 	gcc -Wl,-rpath -Wl,`pwd` -g $^ -o $@
 
-tests/smoke.o: tests/smoke.c unexec.h
+tests/%.o: tests/%.c unexec.h
 	gcc -g -I. -Wall -Wextra -c $< -o $@
 
-tests/smoke_res: tests/smoke
-	./tests/smoke ./tests/new_smoke
+tests/smoke.res: tests/smoke
+	./$< ./tests/new_smoke
 	./tests/new_smoke
 	rm -f ./tests/new_smoke
-	touch tests/smoke_res
+	touch $@
 
-test:: tests/smoke_res
+test:: tests/smoke.res
 
 clean::
-	rm -f tests/*~ tests/*.o tests/smoke
+	rm -f tests/*~ tests/*.o tests/smoke tests/*.res tests/iterate
