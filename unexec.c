@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <elf.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -515,8 +516,8 @@ static int write_elf_binary(const char * path, struct trampoline * tramp){
     close(fd);
     return -1; }
 
-/* How are we going to persist the in-memory state of the process? */
-int unexec(const char * path) {
+/* unexec() proper. This handles storing memory and registers. */
+static int unexec_core(const char * path) {
     int r;
     r = -1;
     struct trampoline * tramp = MAP_FAILED;
@@ -545,7 +546,29 @@ int unexec(const char * path) {
         munmap(tramp, sz); }
     place_phdrs(tramp);
     r = write_elf_binary(path, tramp);
+    if (r == 1) chmod(path, 0700);
   end:
     free(mappings_str);
     if (tramp != MAP_FAILED) munmap(tramp, sz);
+    return r; }
+
+static bool validsignr(int sig) {
+    return sig != SIGKILL && sig != SIGSTOP && sig != 32 && sig != 33; }
+int unexec(const char * path) {
+#define NR_SIGS 64
+    struct sigaction sigs[64];
+    stack_t stack;
+    for (int i = 1; i < NR_SIGS; i++) {
+        if (validsignr(i) && sigaction(i, NULL, &sigs[i]) < 0) {
+            err(1, "save sig %d", i); } }
+    if (sigaltstack(NULL, &stack) < 0) return -1;
+    int r = unexec_core(path);
+    if (r == 0) {
+        /* XXX not clear if returning an error, with the process
+         * half-restored, is the right answer here. Might be cleaner
+         * to just abort(). */
+        for (int i = 1; i < NR_SIGS; i++) {
+            if (validsignr(i) && sigaction(i, &sigs[i], NULL) < 0) {
+                return -1; } }
+        if (sigaltstack(&stack, NULL) < 0) return -1; }
     return r; }
