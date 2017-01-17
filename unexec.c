@@ -62,6 +62,8 @@ struct registerstash {
 struct trampoline {
     unsigned allocated;
     unsigned used;
+    /* What do we want brk() to return when we rehydrate? */
+    unsigned long initialbrk;
     /* The thing which actually gets run when we start. */
     void * trampoline;
     /* What is the trampoline actually going to restore? */
@@ -305,9 +307,14 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         (unsigned long)out->procselfexe;
     return res; }
 
+/* glibc munges this in not terribly helpful ways, so use the syscall
+ * directly. */
+static unsigned long getbrk(void) { return syscall(__NR_brk, 0); }
+
 /* Parse up the mappings file and figure out what we need to program
  * into the trampoline. */
 static int parse_mappings(char * str, struct trampoline * out) {
+    out->initialbrk = getbrk();
     out->used = 0;
     /* Every line in the mapping file needs a mapping operation. */
     out->nrmappings = 0;
@@ -446,8 +453,9 @@ static int parse_mappings(char * str, struct trampoline * out) {
  * out where we're putting the phdrs for them. */
 static void place_phdrs(struct trampoline * tramp) {
     /* Need a phdr for the trampoline itself, which isn't included in
-     * the basic mappings list, and one for the GNUSTACK note */
-    unsigned nr_phdrs = 2;
+     * the basic mappings list, one for the GNUSTACK note, and one for
+     * a dummy which sets initial brk. */
+    unsigned nr_phdrs = 3;
     for (unsigned x = 0; x < tramp->nrmappings; x++) {
         nr_phdrs += tramp->mappings[x].path == NULL; }
     /* Leave space for headers */
@@ -523,6 +531,18 @@ static int write_stack_phdr(int fd) {
     if (write(fd, &phdr, sizeof(phdr)) != sizeof(phdr)) return -1;
     else return 0; }
 
+static int write_brk_phdr(int fd, const struct trampoline * tramp) {
+    Elf64_Phdr phdr = {
+        .p_type = PT_LOAD,
+        .p_vaddr = (unsigned long)tramp->initialbrk - PAGE_SIZE,
+        .p_memsz = PAGE_SIZE,
+        .p_filesz = 0,
+        .p_offset = 0,
+        .p_flags = PF_R | PF_W,
+        .p_align = 0 };
+    if (write(fd, &phdr, sizeof(phdr)) != sizeof(phdr)) return -1;
+    else return 0; }
+
 static int write_elf_binary(const char * path, struct trampoline * tramp){
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0711);
     if (fd < 0) return -1;
@@ -532,6 +552,7 @@ static int write_elf_binary(const char * path, struct trampoline * tramp){
             write_phdr(fd, &tramp->mappings[x]) < 0) goto fail; }
     if (write_trampoline_phdr(fd, tramp) < 0) goto fail;
     if (write_stack_phdr(fd) < 0) goto fail;
+    if (write_brk_phdr(fd, tramp) < 0) goto fail;
     /* Now dump out the actual contents of the phdrs */
     int64_t offset = 0;
     for (unsigned x = 0; x < tramp->nrmappings; x++) {
@@ -577,10 +598,13 @@ static int unexec_core(const char * path) {
     while (true) {
         sz = sizeof(*tramp) + extra_sz;
         sz = (sz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-        tramp = mmap(NULL,
+        /* We need this to be below all other mappings, so that it
+         * doesn't affect initial brk, but not so low the kernel stops
+         * us mapping it. Guess 16 pages from the bottom is safe. */
+        tramp = mmap((void *)(PAGE_SIZE * 16),
                      sz,
                      PROT_READ|PROT_WRITE,
-                     MAP_PRIVATE|MAP_ANONYMOUS,
+                     MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,
                      -1,
                      0);
         if (tramp == MAP_FAILED) goto end;
@@ -592,7 +616,13 @@ static int unexec_core(const char * path) {
         extra_sz = tramp->used;
         munmap(tramp, sz); }
     place_phdrs(tramp);
+    unsigned long brk = getbrk();
     r = write_elf_binary(path, tramp);
+    if (r == 0) {
+        unsigned long newbrk = getbrk();
+        /* This is error-prone and hard to test elsewhere, so asser on it
+         * here. */
+        assert(brk == newbrk); }
     if (r == 1) chmod(path, 0700);
   end:
     free(mappings_str);
