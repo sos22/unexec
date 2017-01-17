@@ -411,8 +411,8 @@ static int parse_mappings(char * str, struct trampoline * out) {
  * out where we're putting the phdrs for them. */
 static void place_phdrs(struct trampoline * tramp) {
     /* Need a phdr for the trampoline itself, which isn't included in
-     * the basic mappings list. */
-    unsigned nr_phdrs = 1;
+     * the basic mappings list, and one for the GNUSTACK note */
+    unsigned nr_phdrs = 2;
     for (unsigned x = 0; x < tramp->nrmappings; x++) {
         nr_phdrs += tramp->mappings[x].path == NULL; }
     /* Leave space for headers */
@@ -467,12 +467,23 @@ static int write_phdr(int fd, const struct mapping * mapping) {
 static int write_trampoline_phdr(int fd, const struct trampoline * tramp) {
     Elf64_Phdr phdr = {
         .p_type = PT_LOAD,
-        .p_type = PT_LOAD,
         .p_vaddr = (unsigned long)tramp,
         .p_memsz = tramp->allocated + sizeof(*tramp),
         .p_filesz = tramp->allocated + sizeof(*tramp),
         .p_offset = tramp->landingoffset,
         .p_flags = PF_R | PF_X,
+        .p_align = 0 };
+    if (write(fd, &phdr, sizeof(phdr)) != sizeof(phdr)) return -1;
+    else return 0; }
+
+static int write_stack_phdr(int fd) {
+    Elf64_Phdr phdr = {
+        .p_type = PT_GNU_STACK,
+        .p_vaddr = 0,
+        .p_memsz = 0,
+        .p_filesz = 0,
+        .p_offset = 0,
+        .p_flags = PF_R,
         .p_align = 0 };
     if (write(fd, &phdr, sizeof(phdr)) != sizeof(phdr)) return -1;
     else return 0; }
@@ -485,6 +496,7 @@ static int write_elf_binary(const char * path, struct trampoline * tramp){
         if (tramp->mappings[x].path == tramp->procselfexe &&
             write_phdr(fd, &tramp->mappings[x]) < 0) goto fail; }
     if (write_trampoline_phdr(fd, tramp) < 0) goto fail;
+    if (write_stack_phdr(fd) < 0) goto fail;
     /* Now dump out the actual contents of the phdrs */
     int64_t offset = 0;
     for (unsigned x = 0; x < tramp->nrmappings; x++) {
