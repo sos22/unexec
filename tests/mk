@@ -1,6 +1,6 @@
-TESTS=tests/smoke tests/iterate tests/signals
+TESTS=tests/iterate tests/signals
 
-all:: $(TESTS)
+all:: tests/smoke $(TESTS)
 
 tests/%: tests/%.o libunexec.so
 	gcc -Wl,-rpath -Wl,`pwd` -g $^ -o $@
@@ -14,7 +14,11 @@ tests/smoke.res: tests/smoke
 	rm -f ./tests/new_smoke
 	touch $@
 
-test:: tests/smoke.res
+test:: $(TESTS)
+	for x in $(TESTS); \
+	do \
+		$$x || exit 1; \
+	done
 
 clean::
 	rm -f tests/*~ tests/*.o tests/*.res $(TESTS)
