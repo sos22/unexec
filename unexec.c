@@ -1,5 +1,6 @@
 #include "unexec.h"
 
+#include <sys/personality.h>
 #include <asm/prctl.h>
 #include <sys/types.h>
 #include <sys/fcntl.h>
@@ -73,6 +74,8 @@ struct trampoline {
     unsigned nrphdrs;
     /* What's the offset of the landing area in the binary? */
     uint64_t landingoffset;
+    /* Copy of all call-clobbered registers, to restore after we
+     * rehydrate. */
     struct registerstash stash;
     unsigned char allocator[]; };
 
@@ -136,6 +139,18 @@ static void * alloc_trampoline_text(struct trampoline *out) {
     asm(
         "    jmp end_trampoline\n"
         "start_trampoline:\n"
+        /* Set personality and disable address
+         * randomisation. Randomisation affects exec behaviour, so
+         * need to re-exec if we changed anything. */
+        "    mov %[___NR_personality], %%rax\n"
+        "set_rsi_persona_no_random:\n"
+        "    movq $0x123456789, %%rdi\n"
+        "    movq %%rdi, %%rbx\n"
+        "    syscall\n"
+        "    testq %%rax, %%rax\n"
+        "    js 3f\n"
+        "    cmpq %%rax, %%rbx\n"
+        "    jne 4f\n" /* re-exec */
         /* Set fsbase */
         "    movq %[_ARCH_SET_FS], %%rdi\n"
         "set_rsi_fsbase:\n"
@@ -220,6 +235,18 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    ret\n"
         "3:\n"
         "    ud2\n"
+        "4:\n"
+        /* Have to re-run execve. stack is argc, then argv, then environ. */
+        "    movq (%%rsp), %%rax\n"
+        "    leaq 8(%%rsp), %%rsi\n" /* argv */
+        "    leaq 8(%%rsi, %%rax, 8), %%rdx\n" /* env */
+        "mov_proc_self_exe_rdi:\n"
+        "    movq $0x123456778, %%rdi\n"
+        "    mov %[___NR_execve], %%rax\n"
+        "    syscall\n"
+        "    jmp 3b\n"
+        "5:\n"
+        ".ascii \"/proc/self/exe\"\n"
         "end_trampoline:\n"
         :
         : [mappings] "i" (offsetof(mappings, struct trampoline)),
@@ -234,10 +261,12 @@ static void * alloc_trampoline_text(struct trampoline *out) {
           [_O_RDONLY] "i" (O_RDONLY),
           [_ARCH_SET_FS] "i" (ARCH_SET_FS),
           [___NR_arch_prctl] "i" (__NR_arch_prctl),
-          [___NR_open] "i" (__NR_open),
+          [___NR_close] "i" (__NR_close),
+          [___NR_execve] "i" (__NR_execve),
           [___NR_mmap] "i" (__NR_mmap),
           [___NR_munmap] "i" (__NR_munmap),
-          [___NR_close] "i" (__NR_close),
+          [___NR_open] "i" (__NR_open),
+          [___NR_personality] "i" (__NR_personality),
           [stash_rbx] "i" (offsetof(stash.rbx, struct trampoline)),
           [stash_rsp] "i" (offsetof(stash.rsp, struct trampoline)),
           [stash_rbp] "i" (offsetof(stash.rbp, struct trampoline)),
@@ -248,14 +277,18 @@ static void * alloc_trampoline_text(struct trampoline *out) {
           [stash_ret] "i" (offsetof(stash.ret, struct trampoline))
         );
     extern const unsigned char start_trampoline[0];
+    extern const unsigned char set_rsi_persona_no_random[0];
     extern const unsigned char set_rsi_fsbase[0];
     extern const unsigned char set_rsi_tramp[0];
     extern const unsigned char set_rdi_tramp_top[0];
     extern const unsigned char set_rsi_kern_base_tramp_top[0];
     extern const unsigned char set_r15_tramp[0];
+    extern const unsigned char mov_proc_self_exe_rdi[0];
     extern const unsigned char end_trampoline[0];
     char * res = alloc_in_trampoline(end_trampoline - start_trampoline, out);
     memcpy(res, start_trampoline, end_trampoline - start_trampoline);
+    *(unsigned long *)(res + 2 + (set_rsi_persona_no_random - start_trampoline)) =
+        personality(0xffffffff) | ADDR_NO_RANDOMIZE;
     *(unsigned long *)(res + 2 + (set_rsi_fsbase - start_trampoline)) =
         (unsigned long)fsbase;
     *(unsigned long *)(res + 2 + (set_rsi_tramp - start_trampoline)) =
@@ -268,6 +301,8 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         KERN_BASE - out_top;
     *(unsigned long *)(res + 2 + (set_r15_tramp - start_trampoline)) =
         (unsigned long)out;
+    *(unsigned long *)(res + 2 + (mov_proc_self_exe_rdi - start_trampoline)) =
+        (unsigned long)out->procselfexe;
     return res; }
 
 /* Parse up the mappings file and figure out what we need to program
@@ -566,19 +601,24 @@ static int unexec_core(const char * path) {
 
 static bool validsignr(int sig) {
     return sig != SIGKILL && sig != SIGSTOP && sig != 32 && sig != 33; }
+
 int unexec(const char * path) {
+    long persona;
+    persona = personality(0xffffffff);
+    if (persona < 0) return -1;
 #define NR_SIGS 64
     struct sigaction sigs[64];
     stack_t stack;
     for (int i = 1; i < NR_SIGS; i++) {
         if (validsignr(i) && sigaction(i, NULL, &sigs[i]) < 0) {
-            err(1, "save sig %d", i); } }
+            return -1; } }
     if (sigaltstack(NULL, &stack) < 0) return -1;
     int r = unexec_core(path);
     if (r == 0) {
         /* XXX not clear if returning an error, with the process
          * half-restored, is the right answer here. Might be cleaner
          * to just abort(). */
+        if (personality(persona) < 0) return -1;
         for (int i = 1; i < NR_SIGS; i++) {
             if (validsignr(i) && sigaction(i, &sigs[i], NULL) < 0) {
                 return -1; } }
