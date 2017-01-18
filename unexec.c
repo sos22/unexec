@@ -150,9 +150,9 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    movq %%rdi, %%rbx\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
-        "    js 3f\n"
+        "    js syscall_failed\n"
         "    cmpq %%rax, %%rbx\n"
-        "    jne 4f\n" /* re-exec */
+        "    jne exec_self\n" /* re-exec */
         /* Set fsbase */
         "    movq %[_ARCH_SET_FS], %%rdi\n"
         "set_rsi_fsbase:\n"
@@ -160,7 +160,7 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    mov %[___NR_arch_prctl], %%eax\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
-        "    js 3f\n"
+        "    js syscall_failed\n"
         /* munmap everything below the trampoline. */
         "    movq $0, %%rdi\n"
         "set_rsi_tramp:\n"
@@ -168,7 +168,7 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    mov %[___NR_munmap], %%rax\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
-        "    js 3f\n"
+        "    js syscall_failed\n"
         /* munmap everything above the trampoline. */
         "set_rdi_tramp_top:\n"
         "    movq $0x123456789, %%rdi\n"
@@ -177,7 +177,7 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    mov %[___NR_munmap], %%rax\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
-        "    js 3f\n"
+        "    js syscall_failed\n"
         "set_r15_tramp:\n"
         "    movq $0x123456789, %%r15\n" /* Patched to @out later */
         "    movq %c[mappings](%%r15), %%r14\n" /* r14 is next mapping */
@@ -186,16 +186,16 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    imul %%rbx, %%rax\n"
         "    addq %%r14, %%rax\n"
         "    movq %%rax, %%r13\n" /* r13 is sentinel mapping */
-        "1:\n"
+        "next_mapping:\n"
         "    cmpq %%r14, %%r13\n"
-        "    je 2f\n"
+        "    je done_mappings\n"
         /* open the next thing to map */
         "    movq %c[offsetpath](%%r14), %%rdi\n"
         "    movq %[_O_RDONLY], %%rsi\n"
         "    movq %[___NR_open], %%rax\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
-        "    js 3f\n"
+        "    js syscall_failed\n"
         "    movq %%rax, %%r12\n"
         /* XXX should probably make some attempt to check the world
          * still looks like what we expect; otherwise, this'll be
@@ -210,17 +210,17 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    movq %[___NR_mmap], %%rax\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
-        "    js 3f\n"
+        "    js syscall_failed\n"
         /* close the fd */
         "    movq %%r12, %%rdi\n"
         "    movq %[___NR_close], %%rax\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
-        "    js 3f\n"
+        "    js syscall_failed\n"
         /* Advance to next structure. */
         "    lea %c[sizeofmapping](%%r14), %%r14\n"
-        "    jmp 1b\n"
-        "2:\n"
+        "    jmp next_mapping\n"
+        "done_mappings:\n"
         /* All mappings restored, r15 set to trampoline
          * structure. Restore call saved registers. */
         "    movq %c[stash_rbx](%%r15), %%rbx\n"
@@ -235,9 +235,9 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         /* save_registers() returns 1 in the new process. */
         "    mov $1, %%eax\n"
         "    ret\n"
-        "3:\n"
+        "syscall_failed:\n"
         "    ud2\n"
-        "4:\n"
+        "exec_self:\n"
         /* Have to re-run execve. stack is argc, then argv, then environ. */
         "    movq (%%rsp), %%rax\n"
         "    leaq 8(%%rsp), %%rsi\n" /* argv */
@@ -246,9 +246,7 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    movq $0x123456778, %%rdi\n"
         "    mov %[___NR_execve], %%rax\n"
         "    syscall\n"
-        "    jmp 3b\n"
-        "5:\n"
-        ".ascii \"/proc/self/exe\"\n"
+        "    jmp syscall_failed\n"
         "end_trampoline:\n"
         :
         : [mappings] "i" (offsetof(mappings, struct trampoline)),
