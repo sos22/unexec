@@ -33,12 +33,10 @@ struct mapping {
     off_t offset;
     unsigned prot;
     unsigned flags;
-    /* Special case for half-constructed tables: path == NULL means
-     * that we're going to map from the binary we write, but we don't
-     * have a phdr assigned yet.*/
-    /* Similarly, when we're writing, if this points at
-     * trampoline::procselfexe this will get a phdr; everything else
-     * gets mmap'd from the filesystem. */
+    /* Special case for half-constructed tables: path ==
+     * tramp->procselfexe means it needs to be mapped from the thing
+     * we're writing. Initially, they have zero offset, and we fill it
+     * in later. Note that this is pointer equality, not strcmp(). */
     const char * path; };
 
 /* All of the registers which we have to restore before
@@ -431,7 +429,8 @@ static int parse_mappings(char * str, struct trampoline * out) {
             /* If we can use an mmap then do it. */
             mapping.offset = offset;
             mapping.path = strdup_in_trampoline(path, out); }
-        else if (can_use_phdr) { /* phdrs are the default. */ }
+        else if (can_use_phdr) {
+            mapping.path = out->procselfexe; }
         else {
             /* Can't mmap, can't phdr -> we fail */
             goto fail; }
@@ -455,13 +454,13 @@ static void place_phdrs(struct trampoline * tramp) {
      * a dummy which sets initial brk. */
     unsigned nr_phdrs = 3;
     for (unsigned x = 0; x < tramp->nrmappings; x++) {
-        nr_phdrs += tramp->mappings[x].path == NULL; }
+        nr_phdrs += tramp->mappings[x].path == tramp->procselfexe; }
     /* Leave space for headers */
     uint64_t offset = sizeof(Elf64_Ehdr) + sizeof(Elf64_Phdr) * nr_phdrs;
     /* Page align */
     offset = (offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     for (unsigned x = 0; x < tramp->nrmappings; x++) {
-        if (tramp->mappings[x].path) continue;
+        if (tramp->mappings[x].path != tramp->procselfexe) continue;
         tramp->mappings[x].offset = offset;
         offset += tramp->mappings[x].size;
         tramp->mappings[x].path = tramp->procselfexe; }
