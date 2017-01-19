@@ -205,10 +205,26 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    movq %c[offsetflags](%%r14), %%r10\n"
         "    movq %%r12, %%r8\n"
         "    movq %c[offsetoffset](%%r14), %%r9\n"
+        "    testq %[_MAP_ANONYMOUS], %%r10\n"
+        "    jz 1f\n" /* Zap FD anonymous maps */
+        "    movq $-1, %%r8\n"
+        "1:\n"
         "    movq %[___NR_mmap], %%rax\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
         "    js syscall_failed\n"
+        /* Anon maps need to be pread in. */
+        "    testq %[_MAP_ANONYMOUS], %c[offsetflags](%%r14)\n"
+        "    jz 1f\n"
+        "    movq %%r12, %%rdi\n"
+        "    movq %c[offsetstart](%%r14), %%rsi\n"
+        "    movq %c[offsetsize](%%r14), %%rdx\n"
+        "    movq %c[offsetoffset](%%r14), %%r10\n"
+        "    movq %[___NR_pread], %%rax\n"
+        "    syscall\n"
+        "    cmpq %%rax, %c[offsetsize](%%r14)\n"
+        "    jne syscall_failed\n"
+        "1:\n"
         /* close the fd */
         "    movq %%r12, %%rdi\n"
         "    movq %[___NR_close], %%rax\n"
@@ -265,6 +281,7 @@ static void * alloc_trampoline_text(struct trampoline *out) {
           [___NR_munmap] "i" (__NR_munmap),
           [___NR_open] "i" (__NR_open),
           [___NR_personality] "i" (__NR_personality),
+          [___NR_pread] "i" (__NR_pread64),
           [stash_rbx] "i" (offsetof(stash.rbx, struct trampoline)),
           [stash_rsp] "i" (offsetof(stash.rsp, struct trampoline)),
           [stash_rbp] "i" (offsetof(stash.rbp, struct trampoline)),
@@ -272,7 +289,8 @@ static void * alloc_trampoline_text(struct trampoline *out) {
           [stash_r13] "i" (offsetof(stash.r13, struct trampoline)),
           [stash_r14] "i" (offsetof(stash.r14, struct trampoline)),
           [stash_r15] "i" (offsetof(stash.r15, struct trampoline)),
-          [stash_ret] "i" (offsetof(stash.ret, struct trampoline))
+          [stash_ret] "i" (offsetof(stash.ret, struct trampoline)),
+          [_MAP_ANONYMOUS] "i" (MAP_ANONYMOUS)
         );
     extern const unsigned char start_trampoline[0];
     extern const unsigned char set_rsi_persona_no_random[0];
@@ -387,6 +405,14 @@ static int parse_mappings(char * str, struct trampoline * out) {
         if (!strcmp(path, "[vsyscall]")) {
             *line_end = '\n';
             continue; }
+        if (!strcmp(path, "[stack]")) {
+            /* Stack is special: it needs to be GROWS_DOWN to handle
+             * future stack expansion, but Linux doesn't let you
+             * combine GROWS_DOWN and fd mapping, and has problems if
+             * you put a GROWS_DOWN right below a FIXED. Answer: the
+             * stack is mapped ANONYMOUS and filled with a pread. */
+            printf("stack at %lx\n", mapping.start);
+            mapping.flags |= MAP_ANONYMOUS | MAP_GROWSDOWN; }
         mapping.flags |= MAP_FIXED;
         /* Other things we need to fix up somehow. Options are phdrs
          * and mmaps. */
@@ -398,6 +424,8 @@ static int parse_mappings(char * str, struct trampoline * out) {
         bool can_use_mmap;
         /* No path -> cannot mmap */
         if (strlen(path) == 0) can_use_mmap = false;
+        /* Anon -> cannot mmap */
+        else if (mapping.flags & MAP_ANONYMOUS) can_use_mmap = false;
         else {
             if (errno) goto fail;
             /* path need to be readable */
