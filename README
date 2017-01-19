@@ -1,0 +1,71 @@
+The unexec hack. Takes a bunch of bits from the current process and
+saves them out as an ELF binary which resumes where this process left
+off. Use it like this:
+
+int main() {
+    ... some complicated initialisation ...
+    int r = unexec("some_file");
+    if (r < 0) err(1, "unexec failed");
+    else if (r > 0) {
+         return 0;
+    }
+    ... normal program stuff ...
+}
+
+And then somewhere else:
+
+    execl("some_file", "some_file", NULL);
+
+Which runs the normal program stuff without having to wait for the
+complicated initialisation.
+
+The obvious problem with this is that the program really does start
+*exactly* where you left it, which makes it hard to do things like
+pass in different command line arguments. Doing anything like that
+requires you to pull commands out of either the filesystem or another
+process.
+
+Things which get saved at unexec time:
+
+-- Registers
+
+-- All of memory:
+
+   -- MAP_SHARED mmaps stay MAP_SHARED of the same file
+   -- MAP_ANONYMOUS and brk pages turn into MAP_PRIVATE mappings of
+      the ELF binary we just wrote.
+   -- For MAP_PRIVATE mmaps, unexec checks whether the mmap contents
+      match the filesystem content. If they do, it stays MAP_PRIVATE
+      of the file. If they don't, it's treated as an ANONYMOUS map.
+   -- The stack gets turned into an ANONYMOUS map, populated with a
+      pread from the binary we wrote.
+
+   Note that things like the environment and argument blocks get
+   restored as part of the stack. There's no way of telling what
+   arguments the rehydrater got passed.
+
+   Things like ld.so and libdl can't tell they've been saved and
+   restored so continue to work as they did before the unexec.
+
+-- Signal handlers get restored.
+
+-- The pid returned by getpid(). unexec followed by restore does not
+   change what getpid() returns, even though you're now running in a
+   new process with a new pid. If you fork() the new child will have
+   the right pid, but there doesn't seem to be any way to fix the
+   parent.
+
+Things which are not saved:
+
+-- File descriptors. That'd be a fairly easy thing to fix if you
+   needed it, though.
+
+-- Threads. It'd maybe be possible to add this by having something
+   which sends SIGSTOP a signal to every thread telling them to save
+   their state and then stop doing anything until we're ready to go
+   again? Obvious complication is that the thread ID would change,
+   which'd probably confuse libpthread in a fairly major way.
+
+-- Child processes. Anything outside of the current process is kind of
+   out of scope for this project.
+
