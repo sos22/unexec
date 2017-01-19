@@ -1,4 +1,4 @@
-TESTS=tests/iterate tests/signals
+TESTS=tests/iterate tests/signals tests/bigstack
 
 all:: tests/smoke $(TESTS)
 
