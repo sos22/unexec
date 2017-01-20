@@ -19,7 +19,7 @@ int main() {
     char template[] = "signalsXXXXXX";
     close(mkstemp(template));
     signal(SIGINT, siginthandler);
-    int r = unexec(template);
+    int r = unexec(template, NULL);
     if (r < 0) err(1, "unexec %s", template);
     if (r == 1) {
         raise(SIGINT);
@@ -41,7 +41,7 @@ int main() {
     printf("sigstack %p\n", ss.ss_sp);
     if (sigaltstack(&ss, NULL) < 0) err(1, "sigaltstack");
     printf("set sigaltstack\n");
-    r = unexec(template);
+    r = unexec(template, NULL);
     if (r < 0) err(1, "unexec2");
     if (r == 1) {
         execl(template, template, NULL);

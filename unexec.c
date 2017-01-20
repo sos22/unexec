@@ -79,6 +79,12 @@ struct trampoline {
     struct registerstash stash;
     unsigned char allocator[]; };
 
+void release_new_environment(struct new_environment * env) {
+    for (unsigned x = 0; x < env->argc; x++) free(env->argv[x]);
+    free(env->argv);
+    for (unsigned x = 0; env->environ[x]; x++) free(env->environ[x]);
+    free(env->environ); }
+
 int save_registers(struct registerstash *);
 
 static void dump_trampoline(const struct trampoline * tramp) {
@@ -159,11 +165,61 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    syscall\n"
         "    testq %%rax, %%rax\n"
         "    js syscall_failed\n"
-        /* munmap everything above the trampoline. */
-        "set_rdi_tramp_top:\n"
+        /* Extend trampoline with new argv and environ from stack. */
+        /* First we need to find out how big the area is. */
+        "    movq (%%rsp), %%rax\n" /* How many arguments do we have? */
+        "    lea 16(%%rsp, %%rax, 8), %%rsi\n" /* Skip past arguments. */
+        "1:  leaq 8(%%rsi), %%rsi\n" /* Skip past environment
+                                      * variables until we get a NULL
+                                      * pointer. */
+        "    movq (%%rsi), %%rax\n"
+        "    testq %%rax, %%rax\n"
+        "    jnz 1b\n"
+        "    movq -8(%%rsi), %%rdi\n" /* rdi is last environment var,
+                                       * so walk it to the end. */
+        "    xor %%al, %%al\n" /* find end of variable. */
+        "    movq $-1, %%rcx\n"
+        "    cld\n"
+        "    repne; scasb\n" /* rdi is now end of bit of stack which
+                                must be copied. */
+        "    movq %%rdi, %%r15\n"
+        "    movq $0xfff, %%rax\n" /* Round boundaries to pages, for
+                                    * mmap */
+        "    addq %%rax, %%rdi\n"
+        "    notq %%rax\n"
+        "    movq %%rsp, %%r14\n"
+        "    andq %%rax, %%r14\n"
+        "    andq %%rax, %%rdi\n"
+        "    subq %%r14, %%rdi\n" /* rdi is how big an allocation we
+                                   * need. */
+        "    movq %%rdi, %%r14\n"
+        "set_rdi_tramp_top:\n" /* ANON mmap to get space above the trampoline */
         "    movq $0x123456789, %%rdi\n"
-        "set_rsi_kern_base_tramp_top:\n"
+        "    movq %%r14, %%rsi\n"
+        "    movq %[READ_WRITE], %%rdx\n"
+        "    movq %[PRIVATE_ANONYMOUS], %%r10\n"
+        "    mov $-1, %%r8\n"
+        "    mov $0, %%r9\n"
+        "    mov %[___NR_mmap], %%rax\n"
+        "    syscall\n"
+        "    testq %%rax, %%rax\n"
+        "    js syscall_failed\n"
+        "    movq %%rax, %%r8\n"
+        "    addq %%r14, %%r8\n"
+        "    movq %%rsp, %%rsi\n" /* copy stack to bounce zone we just
+                                   * allocated. */
+        "    movq %%rsp, (%%rax)\n" /* Top of bounce zone is old rsp,
+                                     * so that we can fix up relative
+                                     * pointers. */
+        "    leaq 8(%%rax), %%rdi\n"
+        "    movq %%r15, %%rcx\n"
+        "    subq %%rsp, %%rcx\n"
+        "    rep; movsb\n"
+        /* munmap everything above the trampoline. */
+        "    movq %%r8, %%rdi\n"
+        "set_rsi_kern_base:\n"
         "    movq $0x123456789, %%rsi\n" /* patched later */
+        "    subq %%r8, %%rsi\n"
         "    mov %[___NR_munmap], %%rax\n"
         "    syscall\n"
         "    testq %%rax, %%rax\n"
@@ -265,6 +321,8 @@ static void * alloc_trampoline_text(struct trampoline *out) {
           [offsetflags] "i" (offsetof(flags, struct mapping)),
           [offsetoffset] "i" (offsetof(offset, struct mapping)),
           [_O_RDONLY] "i" (O_RDONLY),
+          [READ_WRITE] "i" (PROT_READ|PROT_WRITE),
+          [PRIVATE_ANONYMOUS] "i" (MAP_PRIVATE|MAP_ANONYMOUS),
           [_ARCH_SET_FS] "i" (ARCH_SET_FS),
           [___NR_arch_prctl] "i" (__NR_arch_prctl),
           [___NR_close] "i" (__NR_close),
@@ -288,7 +346,7 @@ static void * alloc_trampoline_text(struct trampoline *out) {
     extern const unsigned char set_rsi_persona_no_random[0];
     extern const unsigned char set_rsi_fsbase[0];
     extern const unsigned char set_rdi_tramp_top[0];
-    extern const unsigned char set_rsi_kern_base_tramp_top[0];
+    extern const unsigned char set_rsi_kern_base[0];
     extern const unsigned char set_r15_tramp[0];
     extern const unsigned char mov_proc_self_exe_rdi[0];
     extern const unsigned char end_trampoline[0];
@@ -301,9 +359,8 @@ static void * alloc_trampoline_text(struct trampoline *out) {
     unsigned long out_top = (unsigned long)out + out->allocated + sizeof(*out);
     *(unsigned long *)(res + 2 + (set_rdi_tramp_top - start_trampoline)) =
         out_top;
-    *(unsigned long *)(res + 2 + (set_rsi_kern_base_tramp_top -
-                                  start_trampoline)) =
-        KERN_BASE - out_top;
+    *(unsigned long *)(res + 2 + (set_rsi_kern_base - start_trampoline)) =
+        KERN_BASE;
     *(unsigned long *)(res + 2 + (set_r15_tramp - start_trampoline)) =
         (unsigned long)out;
     *(unsigned long *)(res + 2 + (mov_proc_self_exe_rdi - start_trampoline)) =
@@ -400,7 +457,6 @@ static int parse_mappings(char * str, struct trampoline * out) {
              * combine GROWS_DOWN and fd mapping, and has problems if
              * you put a GROWS_DOWN right below a FIXED. Answer: the
              * stack is mapped ANONYMOUS and filled with a pread. */
-            printf("stack at %lx\n", mapping.start);
             mapping.flags |= MAP_ANONYMOUS | MAP_GROWSDOWN; }
         mapping.flags |= MAP_FIXED;
         /* Other things we need to fix up somehow. Options are phdrs
@@ -456,7 +512,6 @@ static int parse_mappings(char * str, struct trampoline * out) {
         nrdone++;
         *line_end = '\n'; }
     out->nrmappings = nrdone;
-    printf("needed %d, had %d\n", out->used, out->allocated);
     if (errno) goto fail;
     return 0;
   fail:
@@ -598,8 +653,52 @@ static int write_elf_binary(const char * path, struct trampoline * tramp){
     close(fd);
     return -1; }
 
+/* The pointers in the bounce area point at the half-rehydrated stack,
+ * which has now been unmapped. All of the data is copied into the
+ * bounce area, though, so we can get at it with a fairly simple
+ * translation. */
+static const void * translate_new_environment(const void * bounce_area,
+                                              const void * ptr,
+                                              unsigned long rsp) {
+    return (const void *)((unsigned long)ptr -
+                          rsp +
+                          8 +
+                          (unsigned long)bounce_area); }
+
+static void extract_new_environment(const void * bounce_area,
+                                    struct new_environment * env) {
+    unsigned long rsp = ((unsigned long *)bounce_area)[0];
+    unsigned long argc = ((unsigned long *)bounce_area)[1];
+    const char ** new_argv =
+        (const char **)(bounce_area + 2 * sizeof(unsigned long));
+    const char ** new_environ = new_argv + argc + 1;
+    if (env) {
+        env->argc = argc;
+        env->argv = calloc(sizeof(env->argv[0]), argc + 1);
+        for (unsigned x = 0; x < argc; x++) {
+            env->argv[x] = strdup(translate_new_environment(bounce_area,
+                                                            new_argv[x],
+                                                            rsp)); } }
+    unsigned nr_environ;
+    for (nr_environ = 0; new_environ[nr_environ]; nr_environ++) ;
+    if (env) {
+        env->environ = calloc(sizeof(env->environ[0]), nr_environ + 1);
+        for (unsigned x = 0; x < nr_environ; x++) {
+            const char * var = translate_new_environment(bounce_area,
+                                                         new_environ[x],
+                                                         rsp);
+            env->environ[x] = strdup(var); } }
+    const char * last_env = translate_new_environment(bounce_area,
+                                                      new_environ[nr_environ-1],
+                                                      rsp);
+    const void * bounce_end = last_env + strlen(last_env);
+    bounce_end = (void *)(((unsigned long)bounce_end + PAGE_SIZE - 1) &
+                          ~(PAGE_SIZE - 1));
+    munmap((void *)bounce_area, bounce_end - bounce_area);
+}
+
 /* unexec() proper. This handles storing memory and registers. */
-static int unexec_core(const char * path) {
+static int unexec_core(const char * path, struct new_environment * env) {
     int r;
     r = -1;
     struct trampoline * tramp = MAP_FAILED;
@@ -636,8 +735,11 @@ static int unexec_core(const char * path) {
         unsigned long newbrk = getbrk();
         /* This is error-prone and hard to test elsewhere, so asser on it
          * here. */
-        assert(brk == newbrk); }
-    if (r == 1) chmod(path, 0700);
+        assert(brk == newbrk);
+        extract_new_environment((void *)tramp + sz, env); }
+    if (r == 1) {
+        chmod(path, 0700);
+        if (env) memset(env, 0, sizeof(*env)); }
   end:
     free(mappings_str);
     if (tramp != MAP_FAILED) munmap(tramp, sz);
@@ -646,7 +748,7 @@ static int unexec_core(const char * path) {
 static bool validsignr(int sig) {
     return sig != SIGKILL && sig != SIGSTOP && sig != 32 && sig != 33; }
 
-int unexec(const char * path) {
+int unexec(const char * path, struct new_environment * env) {
     long persona;
     persona = personality(0xffffffff);
     if (persona < 0) return -1;
@@ -657,7 +759,7 @@ int unexec(const char * path) {
         if (validsignr(i) && sigaction(i, NULL, &sigs[i]) < 0) {
             return -1; } }
     if (sigaltstack(NULL, &stack) < 0) return -1;
-    int r = unexec_core(path);
+    int r = unexec_core(path, env);
     if (r == 0) {
         /* XXX not clear if returning an error, with the process
          * half-restored, is the right answer here. Might be cleaner

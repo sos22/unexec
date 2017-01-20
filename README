@@ -4,7 +4,7 @@ off. Use it like this:
 
 int main() {
     ... some complicated initialisation ...
-    int r = unexec("some_file");
+    int r = unexec("some_file", NULL);
     if (r < 0) err(1, "unexec failed");
     else if (r > 0) {
          return 0;
@@ -20,10 +20,28 @@ Which runs the normal program stuff without having to wait for the
 complicated initialisation.
 
 The obvious problem with this is that the program really does start
-*exactly* where you left it, which makes it hard to do things like
-pass in different command line arguments. Doing anything like that
-requires you to pull commands out of either the filesystem or another
-process.
+*exactly* where you left it, so you need to do something special if
+you want to get the new program's command line arguments. That's what
+the new_environment block is for:
+
+int main() {
+    struct new_environment new_env;
+    int r = unexec("some_file", &new_env);
+    if (r < 0) err(1, "unexec failed");
+    else if (r > 0) {
+         return 0;
+    }
+    printf("new argv[1] %s\n", new_env.argv[1]);
+}
+
+And then
+
+    execl("some_file", "some_file", "Hello world!", NULL);
+
+will print
+
+    new argv[1] Hello world!
+
 
 Things which get saved at unexec time:
 
@@ -41,8 +59,8 @@ Things which get saved at unexec time:
       pread from the binary we wrote.
 
    Note that things like the environment and argument blocks get
-   restored as part of the stack. There's no way of telling what
-   arguments the rehydrater got passed.
+   restored as part of the stack. Use the new_environment block if you
+   care.
 
    Things like ld.so and libdl can't tell they've been saved and
    restored so continue to work as they did before the unexec.

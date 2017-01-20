@@ -21,7 +21,7 @@ static void burnstack(int cntr) {
 int main() {
     char buf[] = "bigstackXXXXXX";
     close(mkstemp(buf));
-    int r = unexec(buf);
+    int r = unexec(buf, NULL);
     if (r < 0) err(1, "unexec");
     if (r == 1) {
         execl(buf, buf, NULL);

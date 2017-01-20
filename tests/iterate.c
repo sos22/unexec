@@ -29,7 +29,7 @@ int main() {
         close(mkstemp(template));
         printf("%d: in %s\n", x, template);
         double start  = now();
-        int r = unexec(template);
+        int r = unexec(template, NULL);
         if (r < 0) err(1, "unexec");
         if (r == 0) {
             printf("%d: got restored after %f\n", x, now() - start);

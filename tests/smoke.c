@@ -5,7 +5,7 @@
 
 int main(int argc, char *argv[]) {
     if (argc != 2) errx(1, "need a single argument, the thing to unexec to");
-    int r = unexec(argv[1]);
+    int r = unexec(argv[1], NULL);
     if (r == 0) printf("restored\n");
     else if (r == 1) printf("unexeced\n");
     else err(1, "unexec");
