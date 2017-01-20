@@ -159,14 +159,6 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         "    syscall\n"
         "    testq %%rax, %%rax\n"
         "    js syscall_failed\n"
-        /* munmap everything below the trampoline. */
-        "    movq $0, %%rdi\n"
-        "set_rsi_tramp:\n"
-        "    movq $0x123456789, %%rsi\n" /* patched later */
-        "    mov %[___NR_munmap], %%rax\n"
-        "    syscall\n"
-        "    testq %%rax, %%rax\n"
-        "    js syscall_failed\n"
         /* munmap everything above the trampoline. */
         "set_rdi_tramp_top:\n"
         "    movq $0x123456789, %%rdi\n"
@@ -295,7 +287,6 @@ static void * alloc_trampoline_text(struct trampoline *out) {
     extern const unsigned char start_trampoline[0];
     extern const unsigned char set_rsi_persona_no_random[0];
     extern const unsigned char set_rsi_fsbase[0];
-    extern const unsigned char set_rsi_tramp[0];
     extern const unsigned char set_rdi_tramp_top[0];
     extern const unsigned char set_rsi_kern_base_tramp_top[0];
     extern const unsigned char set_r15_tramp[0];
@@ -307,8 +298,6 @@ static void * alloc_trampoline_text(struct trampoline *out) {
         personality(0xffffffff) | ADDR_NO_RANDOMIZE;
     *(unsigned long *)(res + 2 + (set_rsi_fsbase - start_trampoline)) =
         (unsigned long)fsbase;
-    *(unsigned long *)(res + 2 + (set_rsi_tramp - start_trampoline)) =
-        (unsigned long)out;
     unsigned long out_top = (unsigned long)out + out->allocated + sizeof(*out);
     *(unsigned long *)(res + 2 + (set_rdi_tramp_top - start_trampoline)) =
         out_top;
