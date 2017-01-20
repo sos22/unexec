@@ -23,7 +23,7 @@ int main() {
     close(mkstemp(buf));
     int r = unexec(buf);
     if (r < 0) err(1, "unexec");
-    if (r == 0) {
+    if (r == 1) {
         execl(buf, buf, NULL);
         err(1, "execl %s", buf); }
     burnstack(0);

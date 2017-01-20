@@ -43,7 +43,7 @@ int main() {
     printf("set sigaltstack\n");
     r = unexec(template);
     if (r < 0) err(1, "unexec2");
-    if (r == 0) {
+    if (r == 1) {
         execl(template, template, NULL);
         err(1, "exec2"); }
     assert(rsp < (unsigned long)ss.ss_sp ||
