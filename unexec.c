@@ -79,12 +79,6 @@ struct trampoline {
     struct registerstash stash;
     unsigned char allocator[]; };
 
-void release_new_environment(struct new_environment * env) {
-    for (unsigned x = 0; x < env->argc; x++) free(env->argv[x]);
-    free(env->argv);
-    for (unsigned x = 0; env->environ[x]; x++) free(env->environ[x]);
-    free(env->environ); }
-
 int save_registers(struct registerstash *);
 
 static void dump_trampoline(const struct trampoline * tramp) {
@@ -103,24 +97,46 @@ static void dump_trampoline(const struct trampoline * tramp) {
     printf("nr mappings %d\n", tramp->nrphdrs);
     printf("landing offset %lx\n", tramp->landingoffset); }
 
+static void * alloc_with_mmap(size_t sz) {
+    sz = (sz + sizeof(size_t) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    void * res = mmap(NULL,
+                      sz,
+                      PROT_READ|PROT_WRITE,
+                      MAP_PRIVATE|MAP_ANONYMOUS,
+                      -1,
+                      0);
+    assert(res != MAP_FAILED);
+    size_t * res_sz = res;
+    res_sz[0] = sz;
+    return res_sz + 1; }
+
+static void free_with_mmap(void const * what) {
+    if (what == NULL) return;
+    size_t const * sizes = what;
+    sizes--;
+    assert(sizes[0] != 0);
+    assert(!(sizes[0] & (PAGE_SIZE - 1)));
+    munmap((void *)sizes, sizes[0]); }
+
 static char * read_file(const char * path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
-    ssize_t res_sz = 16384;
-    char * res = malloc(res_sz);
+    ssize_t res_sz = 16370;
+    char * res = alloc_with_mmap(res_sz);
     while (true) {
         ssize_t sz = read(fd, res, res_sz);
         if (sz < res_sz) {
             close(fd);
             if (sz < 0) {
-                free(res);
+                free_with_mmap(res);
                 return NULL; }
             else {
                 res[sz] = '\0';
                 return res; } }
         lseek(fd, 0, SEEK_SET);
         res_sz = sz * 2;
-        res = realloc(res, res_sz); } }
+        free_with_mmap(res);
+        res = alloc_with_mmap(res_sz); } }
 
 static void * alloc_in_trampoline(size_t sz, struct trampoline * tramp) {
     static char failure[PAGE_SIZE];
@@ -515,7 +531,6 @@ static int parse_mappings(char * str, struct trampoline * out) {
     if (errno) goto fail;
     return 0;
   fail:
-    abort();
     return -1; }
 
 /* Go through the bits which need mmaps of the ELF binary and figure
@@ -672,30 +687,57 @@ static void extract_new_environment(const void * bounce_area,
     const char ** new_argv =
         (const char **)(bounce_area + 2 * sizeof(unsigned long));
     const char ** new_environ = new_argv + argc + 1;
-    if (env) {
-        env->argc = argc;
-        env->argv = calloc(sizeof(env->argv[0]), argc + 1);
-        for (unsigned x = 0; x < argc; x++) {
-            env->argv[x] = strdup(translate_new_environment(bounce_area,
-                                                            new_argv[x],
-                                                            rsp)); } }
     unsigned nr_environ;
     for (nr_environ = 0; new_environ[nr_environ]; nr_environ++) ;
     if (env) {
-        env->environ = calloc(sizeof(env->environ[0]), nr_environ + 1);
+        unsigned needed = 0;
+        /* argv pointers */
+        needed += sizeof(env->argv[0]) * (argc + 1);
+        /* environment pointers */
+        needed += sizeof(env->environ[0]) * (nr_environ + 1);
+        /* argv values */
+        for (unsigned x = 0; x < argc; x++) {
+            needed += strlen(translate_new_environment(bounce_area,
+                                                       new_argv[x],
+                                                       rsp)) + 1; }
+        /* environ values */
         for (unsigned x = 0; x < nr_environ; x++) {
-            const char * var = translate_new_environment(bounce_area,
+            needed += strlen(translate_new_environment(bounce_area,
+                                                       new_environ[x],
+                                                       rsp)) + 1; }
+        void * buffer = alloc_with_mmap(needed);
+        env->argc = argc;
+        env->argv = buffer;
+        buffer += sizeof(env->argv[0]) * (argc + 1);
+        env->environ = buffer;
+        buffer += sizeof(env->environ[0]) * (nr_environ + 1);
+        for (unsigned x = 0; x < argc; x++) {
+            const char * old = translate_new_environment(bounce_area,
+                                                         new_argv[x],
+                                                         rsp);
+            size_t sz = strlen(old);
+            env->argv[x] = buffer;
+            memcpy(buffer, old, sz + 1);
+            buffer += sz + 1; }
+        for (unsigned x = 0; x < nr_environ; x++) {
+            const char * old = translate_new_environment(bounce_area,
                                                          new_environ[x],
                                                          rsp);
-            env->environ[x] = strdup(var); } }
+            size_t sz = strlen(old);
+            env->environ[x] = buffer;
+            memcpy(buffer, old, sz + 1);
+            buffer += sz + 1; } }
     const char * last_env = translate_new_environment(bounce_area,
                                                       new_environ[nr_environ-1],
                                                       rsp);
     const void * bounce_end = last_env + strlen(last_env);
     bounce_end = (void *)(((unsigned long)bounce_end + PAGE_SIZE - 1) &
                           ~(PAGE_SIZE - 1));
-    munmap((void *)bounce_area, bounce_end - bounce_area);
-}
+    munmap((void *)bounce_area, bounce_end - bounce_area); }
+
+void release_new_environment(struct new_environment * env) {
+    if (!env) return;
+    else free_with_mmap(env->argv); }
 
 /* unexec() proper. This handles storing memory and registers. */
 static int unexec_core(const char * path, struct new_environment * env) {
@@ -733,7 +775,7 @@ static int unexec_core(const char * path, struct new_environment * env) {
     r = write_elf_binary(path, tramp);
     if (r == 0) {
         unsigned long newbrk = getbrk();
-        /* This is error-prone and hard to test elsewhere, so asser on it
+        /* This is error-prone and hard to test elsewhere, so assert on it
          * here. */
         assert(brk == newbrk);
         extract_new_environment((void *)tramp + sz, env); }
@@ -741,7 +783,7 @@ static int unexec_core(const char * path, struct new_environment * env) {
         chmod(path, 0700);
         if (env) memset(env, 0, sizeof(*env)); }
   end:
-    free(mappings_str);
+    free_with_mmap(mappings_str);
     if (tramp != MAP_FAILED) munmap(tramp, sz);
     return r; }
 

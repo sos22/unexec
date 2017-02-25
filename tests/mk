@@ -1,4 +1,4 @@
-TESTS=tests/bigstack tests/environ tests/iterate tests/signals
+TESTS=tests/bigstack tests/environ tests/iterate tests/signals tests/sigsafe
 
 all:: tests/smoke $(TESTS)
 

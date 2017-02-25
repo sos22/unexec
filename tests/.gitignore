@@ -1,6 +1,7 @@
 bigstack
 environ
 signals
+sigsafe
 smoke
 iterate
 *.o
